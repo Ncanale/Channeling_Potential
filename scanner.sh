@@ -1,29 +1,28 @@
 #!/bin/bash
+# Run ciftxt_reader.py for one or more materials over several axes.
+# Usage: ./scanner.sh [material ...]      (default: Ge)
+#        PYTHON=python ./scanner.sh Si Ge C W PbWO4
+# PDFs end up in output/<material>/<axis>/, depths are collected in output/results.txt
+set -euo pipefail
+cd "$(dirname "$0")"
 
-n_cores=$(nproc)
-n_runs=3
+PYTHON=${PYTHON:-python3}
+[ $# -eq 0 ] && set -- Ge
 
-material=Ge
+axis_array=( "1 0 0" "1 1 0" "1 1 1" )
+dir_axis=( "100" "110" "111" )
+n_runs=${#axis_array[@]}
+mkdir -p output
 
-rm -r output/*.bak
-rm -r output/${material}*-*
-
-
-#echo -e "\e[31mNumber of events: $n_events \e[39m..."
-sed -i "s/^Material.*/Material = \"$material\"/" ciftxt_reader.py
-axis_array=( "1 0 0" "1 1 0" "1 1 1")
-dir_axis=( "100" "110" "111")
-
-for (( i=0; i<$n_runs; i++ ))
+for material in "$@"
 do
-    echo "${dir_axis[$i]}"
-    sed -i "s/^asse = r.*/asse = r\"${axis_array[$i]}\"/" ciftxt_reader.py
-    mkdir output/${material}/${dir_axis[$i]}/
-    python3 ciftxt_reader.py
-    mv -f ${material}${dir_axis[$i]}*.pdf output/${material}/${dir_axis[$i]}/ 
-    # cd output/${material}
-    # mv -f ${material}_${dir_axis[$i]}*.pdf ${material}/${dir_axis[$i]}/  
-    # cd ..
-    echo "done $(($i + 1))/$n_runs"
+    for (( i=0; i<n_runs; i++ ))
+    do
+        echo "$material ${dir_axis[$i]}"
+        outdir="output/${material}/${dir_axis[$i]}"
+        rm -rf "$outdir"
+        mkdir -p "$outdir"
+        "$PYTHON" ciftxt_reader.py "$material" "${axis_array[$i]}" --outdir "$outdir" | tee "$outdir/log.txt" | grep RESULT \
+            | tee -a output/results.txt
+    done
 done
-

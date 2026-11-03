@@ -1,8 +1,3 @@
 #!/bin/zsh
-
-cat scanner.sh |
-sed "s+/bin/bash+/bin/zsh+" |
-sed "s/sed -i \"/sed -i .bak \"/" |
-sed "s+n_cores=.*+alias nproc=\"sysctl -n hw.physicalcpu\"\nn_cores=\$(nproc)+" |
-sh
-
+# scanner.sh no longer uses GNU-only commands (sed -i, nproc), so it runs on macOS as is.
+exec bash "$(dirname "$0")/scanner.sh" "$@"
