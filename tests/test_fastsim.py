@@ -1,0 +1,202 @@
+"""Tests of the Geant4 FastSim data-file generator. Run from the repository root:  python -m pytest -q
+
+The agreement with the official Geant4 dataset (G4CHANNELING 2.0) is checked only when the environment
+variable G4CHANNELINGDATA points to the unpacked dataset directory (otherwise these tests are skipped).
+"""
+import os
+
+import numpy as np
+import pytest
+
+from channeling import fastsim, fastsim_format as F
+from channeling import potential_fourier as pf
+from channeling.form_factors import FormFactor
+from channeling.structure import load_structure, parse_indices, resolve_thermal
+from channeling.thermal import ThermalResult
+
+G4DATA = os.environ.get("G4CHANNELINGDATA", "")
+
+
+def thermal(material, T=293.0):
+    s = load_structure(material)
+    return s, resolve_thermal(material, [x.specie.symbol for x in s], T)
+
+
+# ------------------------------------------------------------------ format and splines
+def test_planar_spline_roundtrip_synthetic(tmp_path):
+    n, d = 400, 2.0e-8
+    h = d / n
+    x = np.arange(n + 1) * h
+    f = np.cos(2 * np.pi * x / d) + 0.3 * np.sin(4 * np.pi * x / d)
+    blk = F.planar_block(f, h)
+    coef = np.concatenate([blk] * 4, axis=1)            # Ex, nuc0, el, emin all the same function
+    data = F.FastSimData(1, 1, np.array([5e22]), np.array([7.5e-10]), d, 0.0, n, 0, 21.0, 7.0, coef)
+    path = tmp_path / "X_planes_110.dat"
+    F.write(path, data)
+    back = F.read(path)
+    xs = np.random.default_rng(0).uniform(0, d, 500)
+    ref = np.cos(2 * np.pi * xs / d) + 0.3 * np.sin(4 * np.pi * xs / d)
+    assert back.npx == n and back.nel == 1
+    assert np.abs(F.evaluate(back, "Ex", xs) - ref).max() < 2e-6
+
+
+def test_axial_spline_roundtrip_synthetic(tmp_path):
+    nx, ny, dx, dy = 80, 100, 3.0e-8, 4.0e-8
+    hx, hy = dx / nx, dy / ny
+    X, Y = np.meshgrid(np.arange(nx + 1) * hx, np.arange(ny + 1) * hy, indexing="ij")
+    func = lambda x, y: np.cos(2 * np.pi * x / dx) * np.cos(2 * np.pi * y / dy) + 0.2 * np.sin(2 * np.pi * x / dx)
+    f = func(X, Y)
+    blk = F.axial_block(f, hx, hy)
+    coef = np.zeros((ny, nx + 1, 2, 15))
+    for q in range(5):
+        coef[:, :, :, 3 * q:3 * q + 3] = blk
+    data = F.FastSimData(2, 1, np.array([5e22]), np.array([7.5e-10]), dx, dy, nx, ny, 100.0, 0.0, coef)
+    path = tmp_path / "X_axes_110.dat"
+    F.write(path, data)
+    back = F.read(path)
+    rng = np.random.default_rng(1)
+    xs, ys = rng.uniform(0, dx, 600), rng.uniform(0, dy, 600)
+    err = np.abs(F.evaluate(back, "Ex", xs, ys) - func(xs, ys))
+    assert err.max() < 5e-3            # natural boundary condition in y limits the accuracy at the edges
+    assert np.median(err) < 5e-4
+
+
+def test_inferred_number_of_elements():
+    assert F.infer_nel(2 * 3 + 4 + 100 * 4 * (3 + 3), 1) == 3
+    assert F.infer_nel(2 * 1 + 6 + 10 * 11 * 6 * (4 + 1), 2) == 1
+
+
+# ------------------------------------------------------------------ generated files
+def test_planar_file_consistent_with_fourier_potential(tmp_path):
+    s, th = thermal("Si")
+    hkl = (1, 1, 0)
+    d = fastsim.planar_fastsim(s, hkl, th)
+    P = pf.planar_fourier(s, hkl, {"Si": FormFactor("Si")}, {"Si": th["Si"].tensor()})
+    assert d.vmax == pytest.approx(P.depth, rel=1e-4)
+    assert d.N0[0] == pytest.approx(len(s) / s.volume * 1e24, rel=1e-9)
+    assert d.u[0] == pytest.approx(th["Si"].u * 1e-8)
+    x = np.linspace(0, d.dx, 2001)
+    # field equals dU/dx of the independent planar profile (x = 0 is the minimum of U)
+    xp = P.x
+    dU = np.gradient(P.U, xp) * 1e8
+    xmin = xp[(xp >= 0) & (xp < P.d)][np.argmin(P.U[(xp >= 0) & (xp < P.d)])]
+    ex = F.evaluate(d, "Ex", x[:-1])
+    pos = ((xmin + x[:-1] * 1e8 + P.d) % (2 * P.d)) - P.d          # wrap into the tabulated range
+    ref = np.interp(pos, xp, dU)
+    # rms criterion: the numerical gradient of the reference is unreliable on the sharp peak at the plane
+    assert np.sqrt(np.mean((ex - ref) ** 2)) < 2e-3 * np.abs(ref).max()
+    # normalisations: mean nuclear density 1, mean electron density Z * N0
+    assert F.evaluate(d, "nuc0", x[:-1]).mean() == pytest.approx(1.0, abs=2e-3)
+    assert F.evaluate(d, "el", x[:-1]).mean() == pytest.approx(14 * d.N0[0], rel=2e-3)
+    # the field integrates to the well height: potential energy difference between centre and plane
+    cum = np.cumsum(F.evaluate(d, "Ex", x[:-1])) * (x[1] - x[0])
+    assert cum.max() - cum.min() == pytest.approx(d.vmax, rel=2e-3)
+
+
+def test_axial_file_consistent_with_fourier_potential(tmp_path):
+    s, th = thermal("Si")
+    uvw = (1, 1, 0)
+    d, info = fastsim.axial_fastsim(s, uvw, th)
+    A = pf.axial_fourier(s, parse_indices("1 1 0"), {"Si": FormFactor("Si")}, {"Si": th["Si"].tensor()})
+    assert d.vmax == pytest.approx(A.depth, rel=2e-3)
+    assert d.dx * 1e8 == pytest.approx(s.lattice.a / np.sqrt(2), rel=1e-3) and d.dy * 1e8 == pytest.approx(s.lattice.a, rel=1e-3)
+    # compare the file field with finite differences of the independent Fourier grid
+    e1, e2 = A.frame
+    rng = np.random.default_rng(3)
+    x, y = rng.uniform(0, d.dx * 1e8, 200), rng.uniform(0.05, d.dy * 1e8 - 0.05, 200)
+    r = np.array(info["r0"])[0] * info["ex"] + np.array(info["r0"])[1] * info["ey"]
+    pts = r[None] + x[:, None] * info["ex"] + y[:, None] * info["ey"]
+    X, Y = pts @ e1, pts @ e2
+    h = 1e-3
+    gx = (A.sample(X + h * (info["ex"] @ e1), Y + h * (info["ex"] @ e2)) - A.sample(X - h * (info["ex"] @ e1), Y - h * (info["ex"] @ e2))) / (2 * h)
+    ex = F.evaluate(d, "Ex", x * 1e-8, y * 1e-8) * 1e-8
+    assert np.sqrt(np.mean((ex - gx) ** 2)) < 5e-3 * np.abs(gx).max()
+    assert F.evaluate(d, "nuc0", *np.meshgrid(np.linspace(0, d.dx, 120, endpoint=False), np.linspace(0, d.dy, 200, endpoint=False))).mean() == pytest.approx(1.0, abs=5e-3)
+
+
+def test_compound_files_keep_element_order_and_ratios(tmp_path):
+    s, th = thermal("PbWO4")
+    d = fastsim.planar_fastsim(s, (0, 0, 1), th, order=["O", "Pb", "W"])
+    assert d.nel == 3
+    assert d.N0[0] / d.N0[1] == pytest.approx(4.0) and d.N0[1] == pytest.approx(d.N0[2])
+    x = np.linspace(0, d.dx, 3000, endpoint=False)
+    for name in ("nuc0", "nuc1", "nuc2"):
+        assert F.evaluate(d, name, x).mean() == pytest.approx(1.0, abs=5e-3)
+    zsum = 8 * d.N0[0] + 82 * d.N0[1] + 74 * d.N0[2]
+    assert F.evaluate(d, "el", x).mean() == pytest.approx(zsum, rel=3e-3)
+    path = tmp_path / "PbWO4_planes_001.dat"
+    F.write(path, d)
+    assert F.read(path).nel == 3
+    with pytest.raises(SystemExit):
+        fastsim.planar_fastsim(s, (0, 0, 1), th, order=["O", "Pb"])
+
+
+def test_compound_axial_cell_is_rectangular_and_periodic(tmp_path):
+    s, th = thermal("PbWO4")
+    d, _ = fastsim.axial_fastsim(s, (0, 0, 1), th, order=["O", "Pb", "W"])
+    assert d.nel == 3 and d.dx > 0 and d.dy > 0
+    path = tmp_path / "PbWO4_axes_001.dat"
+    F.write(path, d)
+    back = F.read(path)
+    xs = np.linspace(0, back.dx, 90, endpoint=False)
+    ys = np.linspace(0, back.dy, 90, endpoint=False)
+    X, Y = np.meshgrid(xs, ys)
+    assert F.evaluate(back, "nuc0", X, Y).mean() == pytest.approx(1.0, abs=1e-2)
+    # periodicity: shifting by one cell changes nothing
+    assert np.allclose(F.evaluate(back, "el", X, Y), F.evaluate(back, "el", X + back.dx, Y + back.dy))
+
+
+def test_emin_models():
+    s = load_structure("Si")
+    assert fastsim.emin_constant(s) == pytest.approx(173.0)
+    th = {"Si": ThermalResult(0.075, "fixed", "t")}
+    c = fastsim.planar_fastsim(s, (1, 1, 0), th, emin="amorphous")
+    assert np.allclose(F.evaluate(c, "emin", np.linspace(0, c.dx, 50)), 173.0, atol=1e-6)
+    v = fastsim.planar_fastsim(s, (1, 1, 0), th, emin=50.0)
+    assert np.allclose(F.evaluate(v, "emin", np.linspace(0, v.dx, 50)), 50.0, atol=1e-6)
+    p = fastsim.planar_fastsim(s, (1, 1, 0), th, emin="plasma")
+    e = F.evaluate(p, "emin", np.linspace(0, p.dx, 200))
+    assert e.min() >= 0.5 and e.max() > 3 * e.min()      # ~ sqrt of the density contrast
+
+
+# ------------------------------------------------------------------ agreement with the Geant4 dataset
+needs_g4 = pytest.mark.skipif(not os.path.isdir(G4DATA), reason="set G4CHANNELINGDATA to the unpacked G4CHANNELING dataset")
+
+
+@needs_g4
+@pytest.mark.parametrize("material,name,hkl,u", [("Si", "Si", (1, 1, 0), 0.075), ("Ge", "Ge", (1, 1, 0), 0.085),
+                                                 ("Si", "Si", (1, 1, 1), 0.075)])
+def test_planar_agrees_with_official_files(material, name, hkl, u):
+    s = load_structure(material)
+    th = {material: ThermalResult(u, "fixed", "test")}
+    mine = fastsim.planar_fastsim(s, hkl, th)
+    ref = F.read(os.path.join(G4DATA, f"{name}_planes_{''.join(map(str, hkl))}.dat"))
+    assert mine.dx == pytest.approx(ref.dx, rel=1e-3)
+    assert mine.vmax == pytest.approx(ref.vmax, rel=5e-3)
+    assert mine.vmin == pytest.approx(ref.vmin, rel=2e-2)
+    x = np.linspace(0, ref.dx, 600, endpoint=False)
+    for q, tol in (("Ex", 0.02), ("nuc0", 0.01), ("el", 0.03)):
+        a, b = F.evaluate(mine, q, x), F.evaluate(ref, q, x)
+        assert np.sqrt(np.mean((a - b) ** 2)) < tol * np.abs(b).max()
+
+
+@needs_g4
+def test_axial_agrees_with_official_file_up_to_a_translation():
+    """Si <110>: after the translation that aligns the origins, field and densities coincide."""
+    s = load_structure("Si")
+    th = {"Si": ThermalResult(0.075, "fixed", "test")}
+    mine, _ = fastsim.axial_fastsim(s, (1, 1, 0), th)
+    ref = F.read(os.path.join(G4DATA, "Si_axes_110.dat"))
+    assert mine.dx == pytest.approx(ref.dx, rel=1e-3) and mine.dy == pytest.approx(ref.dy, rel=1e-3)
+    n1, n2 = 120, 120
+    X, Y = np.meshgrid((np.arange(n1) + 0.5) / n1 * ref.dx, (np.arange(n2) + 0.5) / n2 * ref.dy, indexing="ij")
+    a = F.evaluate(ref, "el", X, Y)
+    best = None
+    for sy in (1, -1):
+        b = F.evaluate(mine, "el", X % ref.dx, (sy * Y) % ref.dy)
+        cc = np.fft.ifft2(np.fft.fft2(a) * np.conj(np.fft.fft2(b))).real
+        k = np.unravel_index(np.argmax(cc), cc.shape)
+        sh = (k[0] * ref.dx / n1, k[1] * ref.dy / n2)
+        r = np.sqrt(np.mean((a - F.evaluate(mine, "el", (X - sh[0]) % ref.dx, (sy * (Y - sh[1])) % ref.dy)) ** 2)) / a.max()
+        best = r if best is None else min(best, r)
+    assert best < 0.01

@@ -10,6 +10,10 @@
 #   adp       Ucart: 3x3 displacement tensor [A^2] (tier C2, e.g. from phonopy)
 #   missing   no source found: the user must pass --u El=value
 # Elements not listed under `thermal` use `peng`.
+#
+# FastSim (Geant4) data files: `g4_name` is the Geant4 material name without its first three
+# characters (G4_Si -> Si; the shipped dataset calls diamond 'Diamond'); `g4_elements` is the element
+# order of the Geant4 material (the nuclear-density blocks follow it), e.g. G4_PbWO4 = O, Pb, W.
 
 Si:
   cif: Si.cif
@@ -22,6 +26,7 @@ Ge:
   planes: ["1 1 0", "1 1 1", "1 0 0"]
 
 C:
+  g4_name: Diamond
   cif: C.cif
   axes:   ["1 0 0", "1 1 0", "1 1 1"]
   planes: ["1 1 0", "1 1 1", "1 0 0"]
@@ -39,6 +44,8 @@ Ir:
     Ir: {model: debye, theta: 420.0, source: "Peng 1996 Table 2 (Kittel 1971); approximate"}
 
 PbWO4:
+  g4_name: PbWO4
+  g4_elements: [O, Pb, W]
   cif: PbWO4.cif            # stolzite (scheelite, I4_1/a), COD, a = 5.46979, c = 12.06339 A
   axes:   ["0 0 1", "1 0 0", "1 1 1"]
   planes: ["0 0 1", "1 0 0", "1 0 1"]

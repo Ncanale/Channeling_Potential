@@ -24,6 +24,7 @@ import os
 import numpy as np
 import matplotlib
 
+from channeling import fastsim
 from channeling import observables as obs
 from channeling.form_factors import FormFactor
 from channeling.potential_fourier import axial_fourier, planar_fourier
@@ -55,6 +56,12 @@ def build_parser():
     p.add_argument("--u", nargs="*", default=[], metavar="El=val", help="fixed amplitudes [A], e.g. --u W=0.05")
     p.add_argument("--theta", nargs="*", default=[], metavar="El=val", help="Debye-Waller temperature [K], e.g. --theta W=347")
     p.add_argument("--alpha", type=float, nargs="+", default=None, help="linear thermal expansion [1/K], 1 or 3 values (off by default)")
+    p.add_argument("--fastsim", action="store_true", help="also write the Geant4 channeling FastSim data files (see FASTSIM.md)")
+    p.add_argument("--fastsim-dir", default=None, help="FastSim output root (default <outdir>/fastsim); files go to <dir>/T<T>K/")
+    p.add_argument("--g4-name", default=None, help="Geant4 material name without 'G4_' for the file names (default from materials.yaml)")
+    p.add_argument("--fastsim-step", type=float, default=None, help="interpolation step [A] (default from the thermal amplitude)")
+    p.add_argument("--fastsim-x", default=None, help='crystal direction "h k l" of the cell x axis for axes (default <110>-type)')
+    p.add_argument("--emin", default="amorphous", help="minimal ionisation energy: amorphous | plasma | number [eV]")
     p.add_argument("--no-plots", action="store_true")
     p.add_argument("--show", action="store_true", help="also open interactive plot windows")
     return p
@@ -106,7 +113,7 @@ def thermal_for(material, elements, T, ov):
     return res
 
 
-def run_one(material, uvw, hkl, T, args, outdir, ov):
+def run_one(material, uvw, hkl, T, args, outdir, ov, fastsim_root=None):
     structure = load_structure(material, T=T, alpha=args.alpha)
     elements = [s.specie.symbol for s in structure]
     th = thermal_for(material, elements, T, ov)
@@ -156,6 +163,17 @@ def run_one(material, uvw, hkl, T, args, outdir, ov):
     if len(th) > 1 and a_shares:
         print("  species share of the axial depth: " + ", ".join(f"{k} {v:.1%}" for k, v in a_shares.items()))
     print(f"RESULT {material} <{label(uvw)}> {a_depth:.2f} eV  ({label(hkl)}) {p_depth:.2f} eV  T={T:g}K")
+
+    if args.fastsim:
+        info = material_info(material)
+        g4name = args.g4_name or info.get("g4_name", material)
+        xdir = parse_indices(args.fastsim_x) if args.fastsim_x else None
+        for r in fastsim.write_files(structure, uvw, hkl, th, os.path.join(fastsim_root, f"T{T:g}K"), g4name,
+                                     order=info.get("g4_elements"), step=args.fastsim_step, emin=args.emin,
+                                     xdir=None if xdir is None else tuple(int(a) for a in xdir)):
+            kind = "planes" if r.model == 1 else "axes"
+            size = f"{r.dx:.4f} A, {r.npx} intervals" if r.model == 1 else                 f"{r.dx:.4f} x {r.dy:.4f} A, {r.npx} x {r.npy} intervals"
+            print(f"  FastSim {kind}: {r.path}  [{size}, Vmax {r.vmax:.2f} eV, Vmin {r.vmin:.2f} eV, emin {r.emin}]")
 
     tdir = os.path.join(outdir, f"T{T:g}K")
     os.makedirs(tdir, exist_ok=True)
@@ -246,6 +264,7 @@ def main():
     ov = overrides(args)
     base_out = args.outdir
     pairs = axes_for(args.material, args)
+    fastsim_root = args.fastsim_dir or os.path.join(base_out, "fastsim")
     Ts = temperatures(args)
     summary_path = args.summary or os.path.join(base_out, "summary.csv")
     os.makedirs(os.path.dirname(os.path.abspath(summary_path)), exist_ok=True)
@@ -254,7 +273,7 @@ def main():
         outdir = os.path.join(base_out, label(uvw)) if len(pairs) > 1 else base_out
         rows, profiles = [], []
         for T in Ts:
-            row, prof = run_one(args.material, uvw, hkl, T, args, outdir, ov)
+            row, prof = run_one(args.material, uvw, hkl, T, args, outdir, ov, fastsim_root)
             rows.append(row)
             profiles.append(prof)
         new_rows += rows
