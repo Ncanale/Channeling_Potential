@@ -61,7 +61,7 @@ def build_parser():
     p.add_argument("--g4-name", default=None, help="Geant4 material name without 'G4_' for the file names (default from materials.yaml)")
     p.add_argument("--fastsim-step", type=float, default=None, help="interpolation step [A] (default from the thermal amplitude)")
     p.add_argument("--fastsim-x", default=None, help='crystal direction "h k l" of the cell x axis for axes (default <110>-type)')
-    p.add_argument("--emin", default="amorphous", help="minimal ionisation energy: amorphous | plasma | number [eV]")
+    p.add_argument("--emin", default="fermi", help="minimal ionisation energy: fermi (default, Sytov definition) | amorphous | plasma | number [eV]")
     p.add_argument("--no-plots", action="store_true")
     p.add_argument("--show", action="store_true", help="also open interactive plot windows")
     return p

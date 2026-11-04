@@ -159,6 +159,17 @@ def test_emin_models():
     assert e.min() >= 0.5 and e.max() > 3 * e.min()      # ~ sqrt of the density contrast
 
 
+def test_emin_fermi_planar():
+    """Sytov's local Fermi energy: small in the channel, hundreds of eV on the plane, periodic."""
+    s = load_structure("Si")
+    th = {"Si": ThermalResult(0.075, "fixed", "t")}
+    d = fastsim.planar_fastsim(s, (1, 1, 0), th, emin="fermi")
+    x = np.linspace(0, d.dx, 400, endpoint=False)
+    e = F.evaluate(d, "emin", x)
+    assert 3 < e.min() < 15 and 250 < e.max() < 450
+    assert abs(x[np.argmax(e)] - d.dx / 2) < 0.05 * d.dx      # plane at dx/2, channel centre at 0
+    assert np.allclose(F.evaluate(d, "emin", x + d.dx), e)
+
 # ------------------------------------------------------------------ agreement with the Geant4 dataset
 needs_g4 = pytest.mark.skipif(not os.path.isdir(G4DATA), reason="set G4CHANNELINGDATA to the unpacked G4CHANNELING dataset")
 
@@ -178,6 +189,22 @@ def test_planar_agrees_with_official_files(material, name, hkl, u):
     for q, tol in (("Ex", 0.02), ("nuc0", 0.01), ("el", 0.03)):
         a, b = F.evaluate(mine, q, x), F.evaluate(ref, q, x)
         assert np.sqrt(np.mean((a - b) ** 2)) < tol * np.abs(b).max()
+
+
+@needs_g4
+@pytest.mark.parametrize("name,hkl", [("Si_planes_110", (1, 1, 0)), ("Si_planes_111", (1, 1, 1))])
+def test_emin_fermi_matches_official_at_the_planes(name, hkl):
+    """The 'fermi' T_min reproduces the high quantiles (atoms) of the shipped map within 15 %;
+    in the channels it is higher (about x2, see FASTSIM.md)."""
+    s = load_structure("Si")
+    th = {"Si": ThermalResult(0.075, "fixed", "test")}
+    mine = fastsim.planar_fastsim(s, hkl, th, emin="fermi")
+    ref = F.read(os.path.join(G4DATA, name + ".dat"))
+    x = np.linspace(0, ref.dx, 1000, endpoint=False)
+    a, b = F.evaluate(mine, "emin", x), F.evaluate(ref, "emin", x)
+    for q in (90, 95, 99):
+        assert np.percentile(a, q) == pytest.approx(np.percentile(b, q), rel=0.15)
+    assert np.percentile(a, 5) < 4 * np.percentile(b, 5)
 
 
 @needs_g4
