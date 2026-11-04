@@ -1,0 +1,60 @@
+# Per material: CIF (repository root), default axes/planes (used by scanner.sh, paired by index)
+# and the thermal-amplitude model of each element.
+#
+# Thermal models (see channeling/thermal.py):
+#   peng      Peng 1996 Table 1 (tier A); default for elements that have a table row set
+#   debye     Debye-Waller temperature `theta` [K] (tier B)
+#   trots     isotropic Debye + static term B_static [A^2] (tier C1)
+#   einstein  theta_E [K] (+ optional B_static)
+#   fixed     u [A]
+#   adp       Ucart: 3x3 displacement tensor [A^2] (tier C2, e.g. from phonopy)
+#   missing   no source found: the user must pass --u El=value
+# Elements not listed under `thermal` use `peng`.
+
+Si:
+  cif: Si.cif
+  axes:   ["1 0 0", "1 1 0", "1 1 1"]
+  planes: ["1 1 0", "1 1 1", "1 0 0"]
+
+Ge:
+  cif: Ge.cif
+  axes:   ["1 0 0", "1 1 0", "1 1 1"]
+  planes: ["1 1 0", "1 1 1", "1 0 0"]
+
+C:
+  cif: C.cif
+  axes:   ["1 0 0", "1 1 0", "1 1 1"]
+  planes: ["1 1 0", "1 1 1", "1 0 0"]
+
+W:
+  cif: W.cif
+  axes:   ["1 1 1", "1 0 0", "1 1 0"]
+  planes: ["1 1 0", "1 0 0", "1 1 0"]
+
+Ir:
+  cif: Ir.cif
+  axes:   ["1 1 0", "1 0 0", "1 1 1"]
+  planes: ["1 1 1", "1 0 0", "1 1 1"]
+  thermal:
+    Ir: {model: debye, theta: 420.0, source: "Peng 1996 Table 2 (Kittel 1971); approximate"}
+
+PbWO4:
+  cif: PbWO4.cif            # stolzite (scheelite, I4_1/a), COD, a = 5.46979, c = 12.06339 A
+  axes:   ["0 0 1", "1 0 0", "1 1 1"]
+  planes: ["0 0 1", "1 0 0", "1 0 1"]
+  thermal:
+    # Trots et al., J. Solid State Chem. 183, 1245 (2010), DOI 10.1016/j.jssc.2010.03.039.
+    # Isotropic B_iso(T) from neutron powder diffraction; values read from Fig. 4 by eye (+-10 %).
+    Pb: {model: trots, theta: 141.0, B_static: 0.08, source: "Trots 2010"}
+    W:  {model: trots, theta: 172.0, B_static: 0.19, source: "Trots 2010"}
+    O:  {model: trots, theta: 438.0, B_static: 0.32, source: "Trots 2010"}
+
+SiC:
+  cif: SiC.cif              # 3C-SiC, COD 1011031, a = 4.358 A (1918 data)
+  axes:   ["1 1 0", "1 1 1"]
+  planes: ["1 1 1", "1 1 1"]
+  thermal:
+    # B(T) of Si and C in 3C-SiC: Schowalter et al. 2009 (DOI 10.1107/S0108767308031437) would
+    # be the source, but its tables were not accessible. Nothing is invented: pass --u Si=.. C=..
+    Si: {model: missing, note: "3C-SiC B(T) not available"}
+    C:  {model: missing}

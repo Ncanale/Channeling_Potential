@@ -3263,5 +3263,7 @@
    7.7,
    15.9
   ]
- }
+ },
+ "_doi": "10.1107/S0108767395014371",
+ "_note": "Cross-checked for Si, Ge, W, Ir, C, Pb against the dynasor package tables (same Peng 1996 Table 1, s<6) - identical."
 }

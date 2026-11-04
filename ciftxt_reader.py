@@ -1,196 +1,270 @@
-"""Axial (2D) and planar (1D) continuum channeling potentials from a CIF file.
+"""Axial (2D) and planar (1D) continuum channeling potentials from a CIF file, versus temperature.
 
-Doyle-Turner-type model: each atom is described by the five-Gaussian electron
-scattering factor of Peng et al. (1996) (peng1996.json), thermally smeared with
-the 1D rms vibration amplitude u, and averaged along atomic strings / planes:
-
-  axial  U(rho) = sum_j  lambda_j * 2 e^2 a0 sum_i a_i/(B_i+2u^2) exp(-|rho-rho_j|^2/(B_i+2u^2))
-  planar U(x)   = sum_j sigma_j * 2 sqrt(pi) e^2 a0 sum_i a_i/sqrt(B_i+2u^2) exp(-(x-x_j)^2/(B_i+2u^2))
-
-with B_i = b_i/(4 pi^2), lambda_j = atoms per unit length of string j and
-sigma_j = atoms per unit area of plane j. Works for any lattice and for
-polyatomic crystals; string/plane densities are computed exactly from the cell.
+Thin command-line wrapper around the `channeling` package (see channeling/__init__.py).
+Each atom is described by the Peng et al. (1996) five-Gaussian electron scattering factor (or the
+Moliere form factor), thermally smeared by u_j(T) (Debye-Waller factor, exact for Gaussians) and
+averaged along atomic strings / planes. Works for any lattice and polyatomic crystals.
 
 Usage:
-    python ciftxt_reader.py [material] [axis] [--plane "h k l"] [--outdir DIR] [--u El=val ...] [--show]
-    python ciftxt_reader.py Si "1 1 0"
-    python ciftxt_reader.py PbWO4 "0 0 1" --outdir output/PbWO4/001
-The CIF is read from <material>.cif. For cubic crystals the plane defaults to
-the same indices as the axis; give --plane otherwise.
+    python ciftxt_reader.py Si "1 1 0"                         # 293 K, axis <110>, plane (110)
+    python ciftxt_reader.py PbWO4 "0 0 1" --plane "0 0 1" --T-scan 77,150,293
+    python ciftxt_reader.py Ge --all-axes --T-scan 77,293 --summary output/summary.csv
+    python ciftxt_reader.py W "1 1 1" --model moliere --u W=0.05
+    python ciftxt_reader.py --list-axes Si                      # used by scanner.sh
+
+The CIF is read from <material>.cif in the repository root. Output (per temperature, in
+<outdir>/T<T>K/): PDF plots, an .npz with the maps and a log; one row per (material, axis, T) is
+appended to summary.csv. Depth, maximum field and Lindhard angle do not depend on the projectile
+charge sign (U -> -U); --charge only flips the plotted potential.
 """
 import argparse
-import json
+import csv
 import os
-from math import gcd
 
 import numpy as np
 import matplotlib
 
-E2 = 14.39964   # e^2 [eV*A] (Gaussian units)
-A0 = 0.529177   # Bohr radius [A]; e^2*a0 = hbar^2/m_e
-TAIL = 6.0      # [A] distance beyond which an atom's contribution is negligible
+from channeling import observables as obs
+from channeling.form_factors import FormFactor
+from channeling.potential_fourier import axial_fourier, planar_fourier
+from channeling.potential_realspace import axial_realspace, planar_realspace
+from channeling.structure import load_structure, material_info, parse_indices, resolve_thermal
 
-# 1D rms thermal vibration amplitudes at room temperature [A]
-U_THERMAL = {
-    "Si": 0.075,  # Sytov thesis / Biryukov
-    "Ge": 0.085,  # Baier-Katkov
-    "C": 0.040,   # diamond, Biryukov
-    "W": 0.050,   # Biryukov
-    # PbWO4: approximate, from room-temperature isotropic displacement parameters
-    "Pb": 0.094,
-    "O": 0.110,
-}
-
-parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-parser.add_argument("material", nargs="?", default="Si", help="material name; reads <material>.cif")
-parser.add_argument("axis", nargs="?", default="1 0 0", help='crystal axis [u v w] as "u v w"')
-parser.add_argument("--plane", default=None, help='plane (h k l); default: same indices as the axis')
-parser.add_argument("--outdir", default=".", help="where to save the PDF plots")
-parser.add_argument("--u", nargs="*", default=[], metavar="El=val", help="override thermal amplitudes, e.g. --u W=0.05")
-parser.add_argument("--show", action="store_true", help="also open interactive plot windows")
-args = parser.parse_args()
-
-if not args.show:
-    matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-from pymatgen.core import Structure
-
-here = os.path.dirname(os.path.abspath(__file__))
-with open(os.path.join(here, "peng1996.json")) as f:
-    PENG = json.load(f)
-for item in args.u:
-    el, val = item.split("=")
-    U_THERMAL[el] = float(val)
+CSV_FIELDS = ["material", "axis", "plane", "T_K", "method", "model", "energy_GeV",
+              "axial_depth_eV", "axial_Emax_GeV_cm", "axial_theta_L_urad", "planar_depth_eV", "planar_d_A",
+              "planar_Emax_GeV_cm", "planar_theta_L_urad", "axial_shares", "planar_shares",
+              "u_A", "tier", "extrapolated"]
 
 
-def parse_indices(text):
-    v = np.array([int(t) for t in text.split()])
-    if v.shape != (3,) or not v.any():
-        raise SystemExit(f'Invalid indices "{text}": expected three integers, not all zero')
-    return v // gcd(gcd(*map(abs, v[:2])), abs(v[2]))
+def build_parser():
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("material", nargs="?", default="Si", help="material name; reads <material>.cif")
+    p.add_argument("axis", nargs="?", default=None, help='crystal axis [u v w] as "u v w" (default: first default axis)')
+    p.add_argument("--plane", default=None, help="plane (h k l); default: the default plane paired with the axis, "
+                                                 "or the same indices as the axis")
+    p.add_argument("--all-axes", action="store_true", help="run all default axes/planes of the material")
+    p.add_argument("--list-axes", action="store_true", help="print 'axis|plane|dirname' lines and exit")
+    p.add_argument("--T", type=float, default=None, help="temperature [K] (default 293)")
+    p.add_argument("--T-scan", default=None, help="comma separated temperatures [K], e.g. 77,150,293")
+    p.add_argument("--method", choices=["fourier", "realspace"], default="fourier")
+    p.add_argument("--model", choices=["peng", "moliere"], default="peng", help="form factor model")
+    p.add_argument("--charge", type=int, choices=[1, -1], default=1, help="projectile charge sign (plot only)")
+    p.add_argument("--energy", type=float, default=120.0, help="projectile energy [GeV] for the Lindhard angle")
+    p.add_argument("--outdir", default=".", help="where to save plots/npz/log")
+    p.add_argument("--summary", default=None, help="summary csv (default: <outdir>/summary.csv)")
+    p.add_argument("--u", nargs="*", default=[], metavar="El=val", help="fixed amplitudes [A], e.g. --u W=0.05")
+    p.add_argument("--theta", nargs="*", default=[], metavar="El=val", help="Debye-Waller temperature [K], e.g. --theta W=347")
+    p.add_argument("--alpha", type=float, nargs="+", default=None, help="linear thermal expansion [1/K], 1 or 3 values (off by default)")
+    p.add_argument("--no-plots", action="store_true")
+    p.add_argument("--show", action="store_true", help="also open interactive plot windows")
+    return p
 
 
-uvw = parse_indices(args.axis)
-hkl = parse_indices(args.plane) if args.plane else uvw
-label_ax = "".join(map(str, uvw))
-label_pl = "".join(map(str, hkl))
-os.makedirs(args.outdir, exist_ok=True)
-
-# ----------------------------------------------------------------- structure
-structure = Structure.from_file(os.path.join(here, args.material + ".cif"))
-L = structure.lattice.matrix             # rows: a, b, c [A]
-frac = structure.frac_coords % 1.0
-elements = [site.specie.symbol for site in structure]
-V_cell = structure.volume
-print(f"{args.material}: {structure.composition.reduced_formula}, {len(structure)} atoms per cell, "
-      f"V = {V_cell:.3f} A^3, N = {len(structure) / V_cell:.4e} A^-3")
-
-species = sorted(set(elements))
-coeff = {}
-for el in species:
-    if el not in PENG:
-        raise SystemExit(f"No scattering factor parameters for {el}")
-    if el not in U_THERMAL:
-        raise SystemExit(f"No thermal amplitude for {el}: pass --u {el}=<value in A>")
-    a = np.array(PENG[el]["a"])
-    s2 = np.array(PENG[el]["b"]) / (4 * np.pi ** 2) + 2 * U_THERMAL[el] ** 2   # B_i + 2u^2
-    coeff[el] = (a, s2)
-    print(f"  {el}: u = {U_THERMAL[el]} A, f_e(0) = {a.sum():.3f} A")
+def axes_for(material, args):
+    info = material_info(material)
+    if args.axis is not None:
+        ax = parse_indices(args.axis)
+        pl = parse_indices(args.plane) if args.plane else ax
+        return [(ax, pl)]
+    axes, planes = info.get("axes"), info.get("planes")
+    if not axes:
+        raise SystemExit(f"{material}: give an axis, e.g. python ciftxt_reader.py {material} \"1 0 0\"")
+    pairs = [(parse_indices(a), parse_indices(p)) for a, p in zip(axes, planes)]
+    if args.all_axes:
+        return pairs
+    return pairs[:1]
 
 
-def U_string(r2, el, lam):
-    """Axial potential [eV] of a string of element el with lam atoms/A, at squared distance r2."""
-    a, s2 = coeff[el]
-    return 2 * E2 * A0 * lam * sum(a[i] / s2[i] * np.exp(-r2 / s2[i]) for i in range(len(a)))
+def temperatures(args):
+    if args.T_scan:
+        return [float(t) for t in args.T_scan.split(",")]
+    return [args.T if args.T is not None else 293.0]
 
 
-def U_plane(x, el, sigma):
-    """Planar potential [eV] of a plane of element el with sigma atoms/A^2, at distance x."""
-    a, s2 = coeff[el]
-    return 2 * np.sqrt(np.pi) * E2 * A0 * sigma * sum(a[i] / np.sqrt(s2[i]) * np.exp(-x ** 2 / s2[i])
-                                                       for i in range(len(a)))
+def label(v):
+    return "".join(map(str, v))
 
 
-# ================================================================= AXIAL
-t_vec = uvw @ L                          # lattice translation along the axis
-T = np.linalg.norm(t_vec)                # string period [A]
-t_hat = t_vec / T
-e1 = np.cross(t_hat, [0, 0, 1] if abs(t_hat[2]) < 0.9 else [1, 0, 0])
-e1 /= np.linalg.norm(e1)
-e2 = np.cross(t_hat, e1)
+def overrides(args):
+    out = {}
+    for item in args.u:
+        el, val = item.split("=")
+        out[el] = {"model": "fixed", "u": float(val), "source": "--u"}
+    for item in args.theta:
+        el, val = item.split("=")
+        out[el] = {"model": "debye", "theta": float(val), "source": "--theta"}
+    return out
 
-W = 0.75 * max(structure.lattice.abc)    # half-width of the plotted window
-R = np.sqrt(2) * W + TAIL                # radius of the cylinder of atoms used
-n_max = int(np.ceil((R + T) / min(np.linalg.norm(L, axis=1)))) + 1
-rng = np.arange(-n_max, n_max + 1)
-shifts = np.array(np.meshgrid(rng, rng, rng, indexing="ij")).reshape(3, -1).T
 
-strings = {}                             # (element, x, y) -> atoms in one period T
-for f, el in zip(frac, elements):
-    r = (f + shifts) @ L
-    z = r @ t_hat
-    keep = (z >= -1e-6) & (z < T - 1e-6)
-    rx, ry = r[keep] @ e1, r[keep] @ e2
-    near = rx ** 2 + ry ** 2 <= R ** 2
-    for x, y in zip(rx[near], ry[near]):
-        key = (el, round(x, 3) + 0.0, round(y, 3) + 0.0)
-        strings[key] = strings.get(key, 0) + 1
+def thermal_for(material, elements, T, ov):
+    """Species -> ThermalResult at T, honouring the command-line overrides."""
+    from channeling.thermal import u_of_T
+    res = resolve_thermal(material, [e for e in elements if e not in ov], T)
+    for el, spec in ov.items():
+        if el in elements:
+            res[el] = u_of_T(el, T, spec)
+    return res
 
-grid = np.linspace(-W, W, 401)
-xx, yy = np.meshgrid(grid, grid)
-U_2D = np.zeros_like(xx)
-for (el, x0, y0), count in strings.items():
-    U_2D += U_string((xx - x0) ** 2 + (yy - y0) ** 2, el, count / T)
 
-# the grid may miss the exact string positions: evaluate the maximum there
-on_window = [(x0, y0) for (_, x0, y0) in strings if abs(x0) <= W and abs(y0) <= W]
-U_at_strings = [sum(U_string((x0 - x1) ** 2 + (y0 - y1) ** 2, el, c / T) for (el, x1, y1), c in strings.items())
-                for x0, y0 in on_window]
-U_min = U_2D.min()
-U_max = max([U_2D.max()] + U_at_strings)
-axial_depth = U_max - U_min
-n_str = len({(x, y) for (_, x, y) in strings})
-print(f"axial <{args.axis}>: period T = {T:.3f} A, depth U_max - U_min = {axial_depth:.2f} eV")
+def run_one(material, uvw, hkl, T, args, outdir, ov):
+    structure = load_structure(material, T=T, alpha=args.alpha)
+    elements = [s.specie.symbol for s in structure]
+    th = thermal_for(material, elements, T, ov)
+    ff = {el: FormFactor(el, args.model) for el in th}
+    Ucart = {el: t.tensor() for el, t in th.items()}
+    aniso = any(t.Ucart is not None for t in th.values())
+    if args.method == "realspace" and (args.model != "peng" or aniso):
+        raise SystemExit("--method realspace supports only the Peng model with isotropic u; use --method fourier")
+    print(f"{material} T = {T:g} K  axis <{label(uvw)}>  plane ({label(hkl)})  method={args.method} model={args.model}")
+    for el, t in th.items():
+        print(f"  {el}: u = {t.u:.4f} A  tier {t.tier}{' (extrapolated)' if t.extrapolated else ''}  [{t.source}]")
 
-fig, ax = plt.subplots()
-cs = ax.contourf(xx, yy, U_2D - U_min, np.linspace(0, U_2D.max() - U_min, 150), cmap="jet")
-fig.colorbar(cs, label="U, eV")
-ax.set_title(f"{args.material} <{label_ax}>   depth {axial_depth:.1f} eV")
-ax.set_xlabel(r"x, $\AA$")
-ax.set_ylabel(r"y, $\AA$")
-ax.set_aspect("equal")
-fig.savefig(os.path.join(args.outdir, f"{args.material}{label_ax}_axial.pdf"))
+    if args.method == "fourier":
+        A = axial_fourier(structure, uvw, ff, Ucart)
+        P = planar_fourier(structure, hkl, ff, Ucart)
+        W = 0.75 * max(structure.lattice.abc)
+        grid = np.linspace(-W, W, 401)
+        xx, yy = np.meshgrid(grid, grid)
+        Uwin = A.sample(xx, yy) - A.u_min
+        a_depth, a_emax, a_shares = A.depth, A.emax, A.shares
+        p_x, p_U, p_d, p_depth, p_emax, p_shares = P.x, P.U, P.d, P.depth, P.emax, P.shares
+    else:
+        u = {el: t.u for el, t in th.items()}
+        A = axial_realspace(structure, uvw, u)
+        P = planar_realspace(structure, hkl, u)
+        xx, yy, Uwin = A["xx"], A["yy"], A["U"]
+        gy, gx = np.gradient(Uwin, yy[:, 0], xx[0])
+        a_depth, a_emax, a_shares = A["depth"], float(np.hypot(gx, gy).max()), {}
+        p_x, p_U, p_d, p_depth = P["x"], P["U"], P["d"], P["depth"]
+        p_emax, p_shares = float(np.abs(np.gradient(p_U, p_x)).max()), {}
 
-# ================================================================= PLANAR
-G = hkl @ np.linalg.inv(L).T             # reciprocal lattice vector (no 2 pi)
-d = 1 / np.linalg.norm(G)                # interplanar period [A]
-planes = {}                              # (element, position in [0, d)) -> atoms per cell
-for f, el in zip(frac, elements):
-    xpos = round(((f @ hkl) % 1.0) * d, 4) % round(d, 4)
-    planes[(el, xpos)] = planes.get((el, xpos), 0) + 1
+    row = dict(material=material, axis=label(uvw), plane=label(hkl), T_K=T, method=args.method, model=args.model,
+               energy_GeV=args.energy, axial_depth_eV=round(a_depth, 3),
+               axial_Emax_GeV_cm=round(obs.field_GeV_per_cm(a_emax), 2),
+               axial_theta_L_urad=round(obs.lindhard_angle_urad(a_depth, args.energy), 2),
+               planar_depth_eV=round(p_depth, 3), planar_d_A=round(p_d, 4),
+               planar_Emax_GeV_cm=round(obs.field_GeV_per_cm(p_emax), 2),
+               planar_theta_L_urad=round(obs.lindhard_angle_urad(p_depth, args.energy), 2),
+               axial_shares=";".join(f"{k}:{v:.3f}" for k, v in a_shares.items()),
+               planar_shares=";".join(f"{k}:{v:.3f}" for k, v in p_shares.items()),
+               u_A=";".join(f"{k}:{t.u:.4f}" for k, t in th.items()),
+               tier=";".join(f"{k}:{t.tier}" for k, t in th.items()),
+               extrapolated=";".join(f"{k}:{int(t.extrapolated)}" for k, t in th.items()))
+    print(f"  axial <{label(uvw)}>: depth {a_depth:.2f} eV, E_max {row['axial_Emax_GeV_cm']} GeV/cm, "
+          f"theta_L({args.energy:g} GeV) {row['axial_theta_L_urad']} urad")
+    print(f"  planar ({label(hkl)}): d = {p_d:.4f} A, depth {p_depth:.2f} eV, E_max {row['planar_Emax_GeV_cm']} GeV/cm")
+    if len(th) > 1 and a_shares:
+        print("  species share of the axial depth: " + ", ".join(f"{k} {v:.1%}" for k, v in a_shares.items()))
+    print(f"RESULT {material} <{label(uvw)}> {a_depth:.2f} eV  ({label(hkl)}) {p_depth:.2f} eV  T={T:g}K")
 
-x_pl = np.linspace(-d, d, 2001)          # two periods, centred on a plane
-m_max = int(np.ceil(TAIL / d)) + 2
-U_1D = np.zeros_like(x_pl)
-for (el, x0), count in planes.items():
-    sigma = count / V_cell * d           # atoms per A^2 in each plane of this family
-    for m in range(-m_max, m_max + 1):
-        U_1D += U_plane(x_pl - x0 - m * d, el, sigma)
-U_1D -= U_1D.min()
-planar_depth = U_1D.max()
-positions = sorted({x for (_, x) in planes})
-print(f"planar ({args.plane or args.axis}): period d = {d:.4f} A, planes per period at {positions}, "
-      f"depth = {planar_depth:.2f} eV")
+    tdir = os.path.join(outdir, f"T{T:g}K")
+    os.makedirs(tdir, exist_ok=True)
+    np.savez(os.path.join(tdir, f"{material}{label(uvw)}_T{T:g}K.npz"), axial_x=xx, axial_y=yy, axial_U=Uwin,
+             planar_x=p_x, planar_U=p_U, T=T)
+    if not args.no_plots:
+        import matplotlib.pyplot as plt
+        sign = 1 if args.charge > 0 else -1
+        Z = Uwin if sign > 0 else Uwin.max() - Uwin
+        fig, ax = plt.subplots()
+        cs = ax.contourf(xx, yy, Z, np.linspace(0, Z.max(), 150), cmap="jet")
+        fig.colorbar(cs, label="U, eV")
+        ax.set_title(f"{material} <{label(uvw)}>  {T:g} K  depth {a_depth:.1f} eV")
+        ax.set_xlabel(r"x, $\AA$")
+        ax.set_ylabel(r"y, $\AA$")
+        ax.set_aspect("equal")
+        fig.savefig(os.path.join(tdir, f"{material}{label(uvw)}_axial.pdf"))
+        pU = p_U if sign > 0 else p_U.max() - p_U
+        fig, ax = plt.subplots(figsize=(7, 5))
+        ax.plot(p_x, pU, label=f"{args.model} / {args.method}")
+        ax.set_title(f"{material} ({label(hkl)})  {T:g} K  depth {p_depth:.2f} eV")
+        ax.set_ylabel("U, eV")
+        ax.set_xlabel(r"x, $\AA$")
+        ax.legend()
+        ax.grid()
+        fig.savefig(os.path.join(tdir, f"{material}{label(hkl)}_planar.pdf"))
+        if not args.show:
+            plt.close("all")
+    return row, (p_x, p_U)
 
-fig, ax = plt.subplots(figsize=(7, 5))
-ax.plot(x_pl, U_1D, label="DT (Peng 1996)")
-ax.set_title(f"{args.material} ({label_pl})   depth {planar_depth:.2f} eV")
-ax.set_ylabel("U, eV")
-ax.set_xlabel(r"x, $\AA$")
-ax.legend()
-ax.grid()
-fig.savefig(os.path.join(args.outdir, f"{args.material}{label_pl}_planar.pdf"))
 
-print(f"RESULT {args.material} <{label_ax}> {axial_depth:.2f} eV  ({label_pl}) {planar_depth:.2f} eV")
-if args.show:
-    plt.show()
+def scan_plots(material, uvw, hkl, rows, profiles, outdir, args):
+    import matplotlib.pyplot as plt
+    Ts = [r["T_K"] for r in rows]
+    fig, ax = plt.subplots(figsize=(7, 5))
+    for T, (x, U) in zip(Ts, profiles):
+        ax.plot(x, U, label=f"{T:g} K")
+    ax.set_title(f"{material} ({label(hkl)}) planar potential vs T")
+    ax.set_xlabel(r"x, $\AA$")
+    ax.set_ylabel("U, eV")
+    ax.legend()
+    ax.grid()
+    fig.savefig(os.path.join(outdir, f"{material}{label(hkl)}_planar_Tscan.pdf"))
+    fig, axs = plt.subplots(1, 2, figsize=(10, 4))
+    axs[0].plot(Ts, [r["axial_depth_eV"] for r in rows], "o-", label=f"axial <{label(uvw)}>")
+    axs[0].plot(Ts, [r["planar_depth_eV"] for r in rows], "s-", label=f"planar ({label(hkl)})")
+    axs[0].set_xlabel("T, K")
+    axs[0].set_ylabel("depth, eV")
+    axs[0].legend()
+    axs[0].grid()
+    axs[1].plot(Ts, [r["axial_Emax_GeV_cm"] for r in rows], "o-", label=f"axial <{label(uvw)}>")
+    axs[1].plot(Ts, [r["planar_Emax_GeV_cm"] for r in rows], "s-", label=f"planar ({label(hkl)})")
+    axs[1].set_xlabel("T, K")
+    axs[1].set_ylabel(r"$E_{max}$, GeV/cm")
+    axs[1].legend()
+    axs[1].grid()
+    fig.tight_layout()
+    fig.savefig(os.path.join(outdir, f"{material}{label(uvw)}_depth_field_vs_T.pdf"))
+    plt.close("all")
+
+
+def write_summary(path, new_rows):
+    """Append rows to summary.csv, replacing earlier rows with the same (material, axis, plane, T, method, model)."""
+    key = lambda r: (str(r["material"]), str(r["axis"]), str(r["plane"]), f'{float(r["T_K"]):g}', r["method"], r["model"])
+    old = []
+    if os.path.exists(path):
+        with open(path, newline="") as fh:
+            old = list(csv.DictReader(fh))
+    drop = {key(r) for r in new_rows}
+    rows = [r for r in old if key(r) not in drop] + new_rows
+    with open(path, "w", newline="") as fh:
+        w = csv.DictWriter(fh, fieldnames=CSV_FIELDS)
+        w.writeheader()
+        w.writerows(rows)
+
+
+def main():
+    args = build_parser().parse_args()
+    if args.list_axes:
+        info = material_info(args.material)
+        if not info.get("axes"):
+            raise SystemExit(f"{args.material}: no default axes in materials.yaml")
+        for a, p in zip(info["axes"], info["planes"]):
+            print(f"{a}|{p}|{label(parse_indices(a))}")
+        return
+    if not args.show:
+        matplotlib.use("Agg")
+    ov = overrides(args)
+    base_out = args.outdir
+    pairs = axes_for(args.material, args)
+    Ts = temperatures(args)
+    summary_path = args.summary or os.path.join(base_out, "summary.csv")
+    os.makedirs(os.path.dirname(os.path.abspath(summary_path)), exist_ok=True)
+    new_rows = []
+    for uvw, hkl in pairs:
+        outdir = os.path.join(base_out, label(uvw)) if len(pairs) > 1 else base_out
+        rows, profiles = [], []
+        for T in Ts:
+            row, prof = run_one(args.material, uvw, hkl, T, args, outdir, ov)
+            rows.append(row)
+            profiles.append(prof)
+        new_rows += rows
+        if len(Ts) > 1 and not args.no_plots:
+            scan_plots(args.material, uvw, hkl, rows, profiles, outdir, args)
+    write_summary(summary_path, new_rows)
+    if args.show:
+        import matplotlib.pyplot as plt
+        plt.show()
+
+
+if __name__ == "__main__":
+    main()
