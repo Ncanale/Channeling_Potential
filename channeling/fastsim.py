@@ -29,12 +29,13 @@ Physics:
       same Debye-Waller factor as the potential)
   nuclear density: Debye-Waller-smeared atomic positions
 Minimal ionisation energy (T_min of the single scattering on electrons; the rate goes as n_e/T_min):
-'fermi' (default) = local Fermi energy in Sytov's definition (PRAB 22, 064601 (2019); PhD thesis
-Ferrara 2018): exp(<n_e ln V>/<n_e>) along the string / over the plane, from the 3D crystal
-(emin_fermi.py). It reproduces the shipped G4CHANNELING files at the atoms and makes the Geant4 rocking
-curves agree with them (FASTSIM.md). Alternatives: 'amorphous' = constant I of the crystal (electron-
-weighted geometric mean of the Geant4 NIST mean excitation energies; it gives 2-5 % more channeling near
-the critical angle); 'plasma' = I sqrt(n_el(x)/mean n_el) (floor 0.5 eV); or a number [eV].
+'fermi' (default) = local Thomas-Fermi energy in Sytov's definition (PRAB 22, 064601 (2019); PhD thesis
+Ferrara 2018), every electron with the potential of its own atom: exp(<sum_j n_j ln V_j>/<n_e>) along the
+string / over the plane (emin_fermi.py). It reproduces the shipped G4CHANNELING maps point by point
+(FASTSIM.md). Alternatives: 'fermi-crystal' = the same with the total crystal potential (2-7x higher in the
+channels); 'amorphous' = constant I of the crystal (electron-weighted geometric mean of the Geant4 NIST mean
+excitation energies; it gives 2-5 % more channeling near the critical angle); 'plasma' =
+I sqrt(n_el(x)/mean n_el) (floor 0.5 eV); or a number [eV].
 """
 import os
 from dataclasses import dataclass
@@ -45,7 +46,7 @@ from scipy.fft import ifft2
 from scipy.optimize import minimize, minimize_scalar
 
 from . import fastsim_format as fmt
-from .emin_fermi import CrystalField3D, emin_axial, emin_planar
+from .emin_fermi import FIELDS as FERMI_FIELDS, emin_axial, emin_planar
 from .form_factors import A0, FormFactor
 from .potential_fourier import _qmax, axial_setup, effective_period_factor, planar_setup
 from .structure import plane_frame
@@ -126,7 +127,7 @@ def _emin_values(emin, n_el, Ic):
     if emin == "plasma":
         nbar = n_el.mean()
         return np.maximum(Ic * np.sqrt(np.maximum(n_el, 0.0) / nbar), 0.5)
-    raise SystemExit(f"unknown --emin {emin!r}: use fermi, amorphous, plasma or a number [eV]")
+    raise SystemExit(f"unknown --emin {emin!r}: use fermi, fermi-crystal, amorphous, plasma or a number [eV]")
 
 
 def parse_emin(text):
@@ -182,8 +183,8 @@ def planar_fastsim(structure, hkl, th, order=None, step=None, emin="fermi"):
     Ex = ev(cU, x, 1) / CM                       # dU/dx in eV/cm
     nel = ev(cEl, x) * 1e24
     nucs = [ev(c, x) * Om for c in cNuc]           # cNuc = sfdw/natoms has no 1/Omega: undo the one of ev()
-    if emin == "fermi":
-        emv = emin_planar(CrystalField3D(structure, th, order), S.nhat, x)
+    if isinstance(emin, str) and emin in FERMI_FIELDS:
+        emv = emin_planar(FERMI_FIELDS[emin](structure, th, order), S.nhat, x)
     else:
         emv = _emin_values(emin, nel, emin_constant(structure))
     # fields at the two ends of the period must match (periodic): enforce exact periodicity
@@ -343,9 +344,9 @@ def axial_fastsim(structure, uvw, th, order=None, step=None, emin="fermi", xdir=
     nel = wrap(grid(cEl, r0)) * 1e24
     # nuclear density: coefficients are sfdw/natoms (dimensionless, no 1/Om): undo the 1/Om of grid()
     nucs = [wrap(grid(c, r0)) * Om for c in cNuc]
-    if emin == "fermi":
+    if isinstance(emin, str) and emin in FERMI_FIELDS:
         origin = r0[0] * ex3 + r0[1] * ey3
-        emv = wrap(emin_axial(CrystalField3D(structure, th, order), origin, ex3, ey3, t_hat,
+        emv = wrap(emin_axial(FERMI_FIELDS[emin](structure, th, order), origin, ex3, ey3, t_hat,
                               np.arange(npx) * hx, np.arange(npy) * hy))
     else:
         emv = _emin_values(emin, nel, emin_constant(structure))

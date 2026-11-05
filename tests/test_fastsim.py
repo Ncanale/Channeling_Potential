@@ -8,7 +8,7 @@ import os
 import numpy as np
 import pytest
 
-from channeling import fastsim, fastsim_format as F
+from channeling import emin_fermi, fastsim, fastsim_format as F
 from channeling import potential_fourier as pf
 from channeling.form_factors import FormFactor
 from channeling.structure import load_structure, parse_indices, resolve_thermal
@@ -160,15 +160,34 @@ def test_emin_models():
 
 
 def test_emin_fermi_planar():
-    """Sytov's local Fermi energy: small in the channel, hundreds of eV on the plane, periodic."""
+    """Sytov's local Fermi energy (atomic Thomas-Fermi): a few eV in the channel, ~330 eV on the plane, periodic,
+    and its electron-weighted geometric mean over the cell is the atomic value (orientation independent)."""
     s = load_structure("Si")
     th = {"Si": ThermalResult(0.075, "fixed", "t")}
     d = fastsim.planar_fastsim(s, (1, 1, 0), th, emin="fermi")
-    x = np.linspace(0, d.dx, 400, endpoint=False)
+    x = np.linspace(0, d.dx, 2000, endpoint=False)
     e = F.evaluate(d, "emin", x)
-    assert 3 < e.min() < 15 and 250 < e.max() < 450
+    assert 2 < e.min() < 5 and 250 < e.max() < 450
     assert abs(x[np.argmax(e)] - d.dx / 2) < 0.05 * d.dx      # plane at dx/2, channel centre at 0
     assert np.allclose(F.evaluate(d, "emin", x + d.dx), e)
+    el = F.evaluate(d, "el", x)
+    i_cell = np.exp((el * np.log(e)).sum() / el.sum())
+    assert i_cell == pytest.approx(emin_fermi.atomic_fermi_mean("Si", 0.075), rel=0.01)
+    assert emin_fermi.atomic_fermi_mean("Si", 0.075) == pytest.approx(81.9, rel=0.005)   # shipped Si maps: 81.8-82.0 eV
+
+
+def test_emin_fermi_crystal_vs_atomic():
+    """At the channel centre the crystal potential (neighbours, mean inner potential) gives a higher T_min
+    than the potential of the own atom; on the plane the two coincide within ~10 %."""
+    s = load_structure("Si")
+    th = {"Si": ThermalResult(0.075, "fixed", "t")}
+    n_hat = np.array([1.0, 1.0, 0.0]) / np.sqrt(2)
+    d = s.lattice.a / (2 * np.sqrt(2))                       # (110) spacing; an atomic plane through the origin
+    xs = np.array([0.0, d / 2])
+    tc = emin_fermi.emin_planar(emin_fermi.CrystalField3D(s, th, ["Si"]), n_hat, xs)
+    ta = emin_fermi.emin_planar(emin_fermi.AtomicFermiField(s, th, ["Si"]), n_hat, xs)
+    assert 250 < ta[0] < 450 and ta[0] == pytest.approx(tc[0], rel=0.15)
+    assert 2 < ta[1] < 5 and 5 < tc[1] < 15
 
 # ------------------------------------------------------------------ agreement with the Geant4 dataset
 needs_g4 = pytest.mark.skipif(not os.path.isdir(G4DATA), reason="set G4CHANNELINGDATA to the unpacked G4CHANNELING dataset")
@@ -192,38 +211,61 @@ def test_planar_agrees_with_official_files(material, name, hkl, u):
 
 
 @needs_g4
-@pytest.mark.parametrize("name,hkl", [("Si_planes_110", (1, 1, 0)), ("Si_planes_111", (1, 1, 1))])
-def test_emin_fermi_matches_official_at_the_planes(name, hkl):
-    """The 'fermi' T_min reproduces the high quantiles (atoms) of the shipped map within 15 %;
-    in the channels it is higher (about x2, see FASTSIM.md)."""
+@pytest.mark.parametrize("hkl", [(1, 1, 0), (1, 1, 1), (1, 0, 0)])
+def test_emin_fermi_matches_official_planes(hkl):
+    """'fermi' reproduces the shipped Si map point by point, channels (1.5-5 eV) and planes (~300 eV)."""
     s = load_structure("Si")
     th = {"Si": ThermalResult(0.075, "fixed", "test")}
     mine = fastsim.planar_fastsim(s, hkl, th, emin="fermi")
-    ref = F.read(os.path.join(G4DATA, name + ".dat"))
-    x = np.linspace(0, ref.dx, 1000, endpoint=False)
+    ref = F.read(os.path.join(G4DATA, "Si_planes_%d%d%d.dat" % hkl))
+    x = (np.arange(1000) + 0.5) / 1000 * ref.dx
     a, b = F.evaluate(mine, "emin", x), F.evaluate(ref, "emin", x)
-    for q in (90, 95, 99):
-        assert np.percentile(a, q) == pytest.approx(np.percentile(b, q), rel=0.15)
-    assert np.percentile(a, 5) < 4 * np.percentile(b, 5)
+    r = np.log(a / b)
+    assert abs(r.mean()) < 0.02 and np.sqrt(np.mean(r ** 2)) < 0.07
+    assert a.min() == pytest.approx(b.min(), rel=0.15) and a.max() == pytest.approx(b.max(), rel=0.05)
+
+
+def _si_axis_110():
+    if not hasattr(_si_axis_110, "cache"):
+        s = load_structure("Si")
+        th = {"Si": ThermalResult(0.075, "fixed", "test")}
+        mine, _ = fastsim.axial_fastsim(s, (1, 1, 0), th)
+        _si_axis_110.cache = mine, F.read(os.path.join(G4DATA, "Si_axes_110.dat"))
+    return _si_axis_110.cache
+
+
+def _align(mine, ref, n=120):
+    """Translation and mirror in y with ref(X, Y) ~ mine((X - sx) % dx, sg (Y - sy) % dy), from the electron
+    density; returns (rms error / max, (sx, sy), sg, X, Y)."""
+    X, Y = np.meshgrid((np.arange(n) + 0.5) / n * ref.dx, (np.arange(n) + 0.5) / n * ref.dy, indexing="ij")
+    a = F.evaluate(ref, "el", X, Y)
+    best = None
+    for sg in (1, -1):
+        b = F.evaluate(mine, "el", X % ref.dx, (sg * Y) % ref.dy)
+        cc = np.fft.ifft2(np.fft.fft2(a) * np.conj(np.fft.fft2(b))).real
+        k = np.unravel_index(np.argmax(cc), cc.shape)
+        sh = (k[0] * ref.dx / n, k[1] * ref.dy / n)
+        r = np.sqrt(np.mean((a - F.evaluate(mine, "el", (X - sh[0]) % ref.dx, (sg * (Y - sh[1])) % ref.dy)) ** 2)) / a.max()
+        if best is None or r < best[0]:
+            best = (r, sh, sg, X, Y)
+    return best
 
 
 @needs_g4
 def test_axial_agrees_with_official_file_up_to_a_translation():
     """Si <110>: after the translation that aligns the origins, field and densities coincide."""
-    s = load_structure("Si")
-    th = {"Si": ThermalResult(0.075, "fixed", "test")}
-    mine, _ = fastsim.axial_fastsim(s, (1, 1, 0), th)
-    ref = F.read(os.path.join(G4DATA, "Si_axes_110.dat"))
+    mine, ref = _si_axis_110()
     assert mine.dx == pytest.approx(ref.dx, rel=1e-3) and mine.dy == pytest.approx(ref.dy, rel=1e-3)
-    n1, n2 = 120, 120
-    X, Y = np.meshgrid((np.arange(n1) + 0.5) / n1 * ref.dx, (np.arange(n2) + 0.5) / n2 * ref.dy, indexing="ij")
-    a = F.evaluate(ref, "el", X, Y)
-    best = None
-    for sy in (1, -1):
-        b = F.evaluate(mine, "el", X % ref.dx, (sy * Y) % ref.dy)
-        cc = np.fft.ifft2(np.fft.fft2(a) * np.conj(np.fft.fft2(b))).real
-        k = np.unravel_index(np.argmax(cc), cc.shape)
-        sh = (k[0] * ref.dx / n1, k[1] * ref.dy / n2)
-        r = np.sqrt(np.mean((a - F.evaluate(mine, "el", (X - sh[0]) % ref.dx, (sy * (Y - sh[1])) % ref.dy)) ** 2)) / a.max()
-        best = r if best is None else min(best, r)
-    assert best < 0.01
+    assert _align(mine, ref)[0] < 0.01
+
+
+@needs_g4
+def test_emin_fermi_matches_official_axis():
+    """Si <110>: 'fermi' reproduces the shipped map from 0.28 eV (channel) to ~750 eV (strings)."""
+    mine, ref = _si_axis_110()
+    _, sh, sg, X, Y = _align(mine, ref)
+    a = F.evaluate(mine, "emin", (X - sh[0]) % ref.dx, (sg * (Y - sh[1])) % ref.dy)
+    b = F.evaluate(ref, "emin", X, Y)
+    r = np.log(a / b)
+    assert abs(r.mean()) < 0.03 and np.sqrt(np.mean(r ** 2)) < 0.12
+    assert a.min() == pytest.approx(b.min(), rel=0.2) and a.max() == pytest.approx(b.max(), rel=0.05)
