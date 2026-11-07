@@ -1,0 +1,5 @@
+test,geant4_mean,geant4_seed_std,nostri_mean,nostri_seed_std,p_KS,p_t,note
+rocking: null (G_s - G_s+1)/<G> vs cross (N_s - G_s+1)/<G> [%],0.0000,1.9084,0.0744,1.8202,0.8960,,39 points x 14 seeds
+"rocking: per-point seed scatter, median [%]",,1.2876,,1.1909,,,
+radiation W<111>: radiated energy per e- [MeV],46.7150,2.2208,47.3657,2.1758,0.3356,0.3552,20 seeds x 2000 e-; Levene p 0.574
+radiation W<111>: radiated energy 178-438 MeV per e- [MeV],11.4722,1.3566,11.8016,0.9607,0.5713,0.3817,20 seeds x 2000 e-; Levene p 0.640
