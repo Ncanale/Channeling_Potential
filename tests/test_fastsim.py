@@ -10,7 +10,7 @@ import pytest
 
 from channeling import emin_fermi, fastsim, fastsim_format as F
 from channeling import potential_fourier as pf
-from channeling.form_factors import FormFactor
+from channeling.form_factors import FormFactor, atom_model
 from channeling.structure import load_structure, parse_indices, resolve_thermal
 from channeling.thermal import ThermalResult
 
@@ -71,7 +71,7 @@ def test_planar_file_consistent_with_fourier_potential(tmp_path):
     s, th = thermal("Si")
     hkl = (1, 1, 0)
     d = fastsim.planar_fastsim(s, hkl, th)
-    P = pf.planar_fourier(s, hkl, {"Si": FormFactor("Si")}, {"Si": th["Si"].tensor()})
+    P = pf.planar_fourier(s, hkl, {"Si": FormFactor("Si", atom_model("Si")[0])}, {"Si": th["Si"].tensor()})
     assert d.vmax == pytest.approx(P.depth, rel=1e-4)
     assert d.N0[0] == pytest.approx(len(s) / s.volume * 1e24, rel=1e-9)
     assert d.u[0] == pytest.approx(th["Si"].u * 1e-8)
@@ -234,38 +234,69 @@ def _si_axis_110():
     return _si_axis_110.cache
 
 
-def _align(mine, ref, n=120):
-    """Translation and mirror in y with ref(X, Y) ~ mine((X - sx) % dx, sg (Y - sy) % dy), from the electron
-    density; returns (rms error / max, (sx, sy), sg, X, Y)."""
-    X, Y = np.meshgrid((np.arange(n) + 0.5) / n * ref.dx, (np.arange(n) + 0.5) / n * ref.dy, indexing="ij")
-    a = F.evaluate(ref, "el", X, Y)
-    best = None
-    for sg in (1, -1):
-        b = F.evaluate(mine, "el", X % ref.dx, (sg * Y) % ref.dy)
-        cc = np.fft.ifft2(np.fft.fft2(a) * np.conj(np.fft.fft2(b))).real
-        k = np.unravel_index(np.argmax(cc), cc.shape)
-        sh = (k[0] * ref.dx / n, k[1] * ref.dy / n)
-        r = np.sqrt(np.mean((a - F.evaluate(mine, "el", (X - sh[0]) % ref.dx, (sg * (Y - sh[1])) % ref.dy)) ** 2)) / a.max()
-        if best is None or r < best[0]:
-            best = (r, sh, sg, X, Y)
-    return best
+def _grid(ref, n=120):
+    return np.meshgrid((np.arange(n) + 0.5) / n * ref.dx, (np.arange(n) + 0.5) / n * ref.dy, indexing="ij")
 
 
 @needs_g4
-def test_axial_agrees_with_official_file_up_to_a_translation():
-    """Si <110>: after the translation that aligns the origins, field and densities coincide."""
+def test_axial_agrees_with_official_file_point_by_point():
+    """Si <110>: same cell, origin and orientation as the official file: field and densities coincide directly."""
     mine, ref = _si_axis_110()
     assert mine.dx == pytest.approx(ref.dx, rel=1e-3) and mine.dy == pytest.approx(ref.dy, rel=1e-3)
-    assert _align(mine, ref)[0] < 0.01
+    X, Y = _grid(ref)
+    a = F.evaluate(ref, "el", X, Y)
+    assert np.sqrt(np.mean((F.evaluate(mine, "el", X, Y) - a) ** 2)) / a.max() < 0.005
+    E = np.hypot(F.evaluate(ref, "Ex", X, Y), F.evaluate(ref, "Ey", X, Y)).max()
+    for q in ("Ex", "Ey"):
+        assert np.sqrt(np.mean((F.evaluate(mine, q, X, Y) - F.evaluate(ref, q, X, Y)) ** 2)) / E < 0.005
+
+
+@pytest.mark.parametrize("name, uvw, el", [("Si_axes_100", (1, 0, 0), "Si"), ("Si_axes_111", (1, 1, 1), "Si"),
+                                           ("W_axes_111", (1, 1, 1), "W")])
+@needs_g4
+def test_axial_origin_convention(name, uvw, el):
+    """Strings on the main diagonal with their mean at the cell centre, as in the official files (also bcc <111>,
+    where the rectangular cell holds two strings but the cubic cell projects onto one)."""
+    ref = F.read(os.path.join(G4DATA, name + ".dat"))
+    u = ref.u[0] / 1e-8
+    mine, _ = fastsim.axial_fastsim(load_structure(el), uvw, {el: ThermalResult(u, "fixed", "test")}, emin=0.0)
+    X, Y = _grid(ref)
+    a = F.evaluate(ref, "nuc0", X, Y)
+    assert np.sqrt(np.mean((F.evaluate(mine, "nuc0", X, Y) - a) ** 2)) / a.max() < 0.01
 
 
 @needs_g4
 def test_emin_fermi_matches_official_axis():
     """Si <110>: 'fermi' reproduces the shipped map from 0.28 eV (channel) to ~750 eV (strings)."""
     mine, ref = _si_axis_110()
-    _, sh, sg, X, Y = _align(mine, ref)
-    a = F.evaluate(mine, "emin", (X - sh[0]) % ref.dx, (sg * (Y - sh[1])) % ref.dy)
+    X, Y = _grid(ref)
+    a = F.evaluate(mine, "emin", X, Y)
     b = F.evaluate(ref, "emin", X, Y)
     r = np.log(a / b)
     assert abs(r.mean()) < 0.03 and np.sqrt(np.mean(r ** 2)) < 0.12
     assert a.min() == pytest.approx(b.min(), rel=0.2) and a.max() == pytest.approx(b.max(), rel=0.05)
+
+
+def test_atom_model_is_dudarev_peng_whelan():
+    """Dudarev-Peng-Whelan 1995 (Tables 1-2) + Mott-Bethe for the elements of their table, Peng otherwise."""
+    from channeling.form_factors import dpw_table
+    t = dpw_table()
+    assert len(t) == 50 and t["C"]["a"][0] == pytest.approx(0.6617) and t["W"]["b"][4] == pytest.approx(0.07291)
+    assert atom_model("Si") == ("dpw", "mott-bethe") and atom_model("Pb") == ("dpw", "mott-bethe")
+    assert atom_model("Bi") == ("peng", "mott-bethe")
+
+
+@pytest.mark.parametrize("name, el, u, tmax, nmax", [("Si_planes_110", "Si", 0.075, 0.015, 0.002),
+                                                     ("Ge_planes_110", "Ge", 0.085, 0.015, 0.002),
+                                                     ("Diamond_planes_110", "C", 0.040, 0.015, 0.002)])
+@needs_g4
+def test_atomic_model_per_element_matches_official_planes(name, el, u, tmax, nmax):
+    """With Dudarev-Peng-Whelan 1995 and the Mott-Bethe density the shipped T_min and n_e are reproduced
+    (rms of (ours - official)/official below tmax; n_e rms below nmax of its maximum)."""
+    ref = F.read(os.path.join(G4DATA, name + ".dat"))
+    d = fastsim.planar_fastsim(load_structure(el), (1, 1, 0), {el: ThermalResult(u, "fixed", "test")}, emin="fermi")
+    x = (np.arange(1000) + 0.5) / 1000 * ref.dx
+    t = F.evaluate(d, "emin", x) / F.evaluate(ref, "emin", x) - 1
+    a = F.evaluate(ref, "el", x)
+    assert np.sqrt(np.mean(t ** 2)) < tmax
+    assert np.sqrt(np.mean((F.evaluate(d, "el", x) - a) ** 2)) / a.max() < nmax

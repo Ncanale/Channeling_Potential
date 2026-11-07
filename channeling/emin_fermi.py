@@ -35,14 +35,14 @@ import numpy as np
 from pymatgen.core import Element
 from scipy.ndimage import map_coordinates
 
-from .form_factors import A0, E2, FormFactor
+from .form_factors import A0, E2, FormFactor, atom_model, density_q, density_r
 
 TINY = 1e-12
 
 
 def _grid(structure, th, order, spacing, max_points):
     L = np.array(structure.lattice.matrix, float)                    # rows: lattice vectors [A]
-    ff = {el: FormFactor(el, "peng") for el in order}
+    ff = {el: FormFactor(el, atom_model(el)[0]) for el in order}
     U = {el: th[el].tensor() for el in order}
     if spacing is None:
         bmin = min(ff[el].b.min() / (4 * np.pi ** 2) + 2 * np.linalg.eigvalsh(U[el]).min() for el in order)
@@ -93,7 +93,7 @@ class CrystalField3D(_Periodic):
                                 + 2 * (Ue[0, 1] * Gx * Gy + Ue[0, 2] * Gx * Gz + Ue[1, 2] * Gy * Gz)))
             Ut = ff[el](G2)                                          # eV A^3
             VG += Ut * DW * S
-            nG += (Element(el).Z - G2 * Ut / (4 * np.pi * E2)) * DW * S
+            nG += density_q(ff[el], G2, atom_model(el)[1]) * DW * S
             del S, DW, Ut
         ntot = N.prod()
         self.A = self.V = np.real(np.fft.ifftn(VG)) * ntot / Om
@@ -109,17 +109,13 @@ class CrystalField3D(_Periodic):
 def atom_tf(ff, u, r):
     """Electron density n(r) [A^-3] (negative values of the fit set to 0) and potential energy V(r) [eV]
     of a unit positive charge, for one atom thermally smeared with the isotropic amplitude u [A].
-    Peng Gaussians: U~(q) = 2 pi e^2 a0 sum a_i exp(-b_i q^2/16pi^2); n from Poisson,
-    n = n_nucleus + lap(V) / (4 pi e^2)."""
+    Gaussian form factors: U~(q) = 2 pi e^2 a0 sum a_i exp(-b_i q^2/16pi^2); n with the density route of the
+    element (form_factors.atom_model): Poisson, n = n_nucleus + lap(V) / (4 pi e^2), or the X-ray form factor."""
     V = np.zeros_like(r)
-    lap = np.zeros_like(r)
     for a, b in zip(ff.a, ff.b):
         al = b / (16 * np.pi ** 2) + u * u / 2                        # U~ ~ exp(-al q^2)
-        g = 2 * np.pi * E2 * A0 * a * (4 * np.pi * al) ** -1.5 * np.exp(-r * r / (4 * al))
-        V += g
-        lap += g * (r * r / (4 * al * al) - 3 / (2 * al))
-    n = ff.Z * (2 * np.pi * u * u) ** -1.5 * np.exp(-r * r / (2 * u * u)) + lap / (4 * np.pi * E2)
-    return np.clip(n, 0.0, None), V
+        V += 2 * np.pi * E2 * A0 * a * (4 * np.pi * al) ** -1.5 * np.exp(-r * r / (4 * al))
+    return density_r(ff, u, r, atom_model(ff.element)[1]), V
 
 
 def _hankel(f, r, q, block=256):
@@ -143,7 +139,7 @@ def atom_radial_grid(ff, u):
 def atomic_fermi_mean(element, u):
     """exp( int n ln V d3r / int n d3r ) [eV] of one atom (thermal amplitude u [A]): the electron-weighted
     geometric mean of T_min over any cell of a crystal of this element ('fermi' definition)."""
-    ff = FormFactor(element, "peng")
+    ff = FormFactor(element, atom_model(element)[0])
     r = atom_radial_grid(ff, u)
     n, V = atom_tf(ff, u, r)
     w = r * r * n

@@ -19,14 +19,20 @@ Conventions (checked against the Geant4 dataset G4CHANNELING 2.0, see tests and 
   - axes: the cell is the rectangle dx x dy spanned by lattice vectors of the potential along
     x (default: the first of [1 -1 0], [0 1 -1], [1 0 -1] perpendicular to the axis, i.e. a <110> direction, as in the
     shipped files; then [0 1 0], [0 0 1], [1 0 0]) and
-    y = z x x (z along the axis); the origin of the cell is the potential minimum.
+    y = z x x (z along the axis). Origin as in the official files: the atomic strings lie on the main diagonal
+    of the cell with their mean position at the centre (one string at (dx/2, dy/2); two at (dx/4, dy/4) and
+    (3dx/4, 3dy/4); the <110> dumbbells of the diamond lattice centred there), so that our maps coincide with
+    the shipped ones point by point, without translation or mirror.
   - Planes: Vmin is the minimum of the absolute potential energy (mean inner potential included,
     zero in vacuum). Axes: the shipped files carry 0, and so do ours.
 
 Physics:
-  U~_j(q) = 2 pi e^2 a0 f_e,j(q/4pi)  (Peng 1996 scattering factors, form_factors.py)
-  electron density: rho~_j(q) = Z_j - (a0 q^2 / 2) f_e,j  (Mott-Bethe; Poisson equation, with the
-      same Debye-Waller factor as the potential)
+  U~_j(q) = 2 pi e^2 a0 f_e,j(q/4pi)  (Gaussian electron scattering factors, form_factors.py)
+  electron density: rho~_j(q) = Z_j - (a0 q^2 / 2) f_e,j  (Mott-Bethe; Poisson equation) or the X-ray form factor
+      f_x,j (Waasmaier-Kirfel), with the same Debye-Waller factor as the potential
+  atomic model per element (form_factors.atom_model): Dudarev-Peng-Whelan 1995 + Mott-Bethe, the model of
+      G4CHANNELING 2.0, for the 50 elements of their table (C, Si, Ge, W, O, Pb, ...); Peng 1996 + Mott-Bethe for
+      all others
   nuclear density: Debye-Waller-smeared atomic positions
 Minimal ionisation energy (T_min of the single scattering on electrons; the rate goes as n_e/T_min):
 'fermi' (default) = local Thomas-Fermi energy in Sytov's definition (PRAB 22, 064601 (2019); PhD thesis
@@ -47,7 +53,7 @@ from scipy.optimize import minimize, minimize_scalar
 
 from . import fastsim_format as fmt
 from .emin_fermi import FIELDS as FERMI_FIELDS, emin_axial, emin_planar
-from .form_factors import A0, FormFactor
+from .form_factors import FormFactor, atom_model, density_q
 from .potential_fourier import _qmax, axial_setup, effective_period_factor, planar_setup
 from .structure import plane_frame
 
@@ -99,13 +105,12 @@ def emin_constant(structure):
 
 
 def _density_weights(structure, order, th, dw_only=True):
-    """Per-element weight functions of q^2 for the electron density (Mott-Bethe from the Peng f_e)."""
-    ff = {el: FormFactor(el, "peng") for el in order}
+    """Form factors of the potential and per-element electron density n~(q^2), with the atomic model of each
+    element (form_factors.atom_model: Mott-Bethe from f_e, or the X-ray form factor)."""
+    ff = {el: FormFactor(el, atom_model(el)[0]) for el in order}
 
     def rho_el(el, G2):
-        f = ff[el]
-        fe = np.sum(f.a[:, None] * np.exp(-f.b[:, None] * G2[None] / (16 * np.pi ** 2)), axis=0)
-        return Element(el).Z - 0.5 * A0 * G2 * fe
+        return density_q(ff[el], G2, atom_model(el)[1])
 
     return ff, rho_el
 
@@ -251,6 +256,43 @@ def _rectangular_cell(A2, ex, ey, M=12):
     return out[0], out[1]
 
 
+def _solve_centre(a):
+    """Shifts t in [0, 1) with mean(wrap(a - t)) = 1/2 (a: fractional coordinates of the strings)."""
+    a = np.sort(np.mod(a, 1.0))
+    n = len(a)
+    out = []
+    for m in range(n + 1):
+        t = a.mean() + m / n - 0.5
+        if 0.0 <= t < 1.0 and np.sum(a < t - 1e-12) == m:
+            out.append(t)
+    return out
+
+
+def _geant4_origin(cart, L, ex3, ey3, Dx, Dy):
+    """Cell origin (x, y) [A] with the convention of the G4CHANNELING 2.0 axial files: the mean position of the atomic
+    strings in the cell is at the centre (dx/2, dy/2), and the strings lie on the main diagonal, i.e. a single string
+    at (1/2, 1/2), two at (1/4, 1/4) and (3/4, 3/4), the <110> dumbbells of the diamond lattice centred there.
+    cart: atoms of the structure cell; L: lattice vectors (rows). Lattice translations are added because the
+    rectangular cell can hold more strings than the projection of the structure cell (e.g. bcc <111>)."""
+    m = np.arange(-2, 3)
+    T = np.array(np.meshgrid(m, m, m, indexing="ij")).reshape(3, -1).T @ L
+    pts = (cart[:, None, :] + T[None]).reshape(-1, 3)
+    f = np.mod(np.c_[pts @ ex3 / Dx, pts @ ey3 / Dy], 1.0)
+    cols = []
+    for p in f:
+        if not any(np.all(np.abs(((p - q + 0.5) % 1.0) - 0.5) < 1e-6) for q in cols):
+            cols.append(p)
+    cols = np.array(cols)
+    best = None
+    for tx in _solve_centre(cols[:, 0]):
+        for ty in _solve_centre(cols[:, 1]):
+            g = np.mod(cols - [tx, ty], 1.0) - 0.5
+            score = np.sum(np.sign(np.round(g[:, 0] * g[:, 1], 9)))
+            if best is None or score > best[0]:
+                best = (score, tx, ty)
+    return best[1] * Dx, best[2] * Dy
+
+
 def axial_fastsim(structure, uvw, th, order=None, step=None, emin="fermi", xdir=None):
     """FastSimData (model 2) for strings along [uvw]. xdir: crystal direction (h k l) of the cell x axis."""
     order = _element_order(structure, order)
@@ -324,13 +366,13 @@ def axial_fastsim(structure, uvw, th, order=None, step=None, emin="fermi", xdir=
         np.add.at(C, (P % npx, Q % npy), cc)
         return (npx * npy / Om) * ifft2(C).real
 
-    # origin = potential minimum
+    # potential minimum (for Vmax); the cell origin follows the convention of the official files
     U0 = grid(cU, (0.0, 0.0))
     i0, j0 = np.unravel_index(np.argmin(U0), U0.shape)
     res = minimize(lambda r: direct(cU, np.array([r]))[0], np.array([i0 * hx, j0 * hy]), method="Nelder-Mead",
                    options=dict(xatol=1e-7, fatol=1e-10, maxiter=400))
-    r0 = tuple(res.x)
-    umin = float(direct(cU, np.array([r0]))[0])
+    umin = float(direct(cU, np.array([res.x]))[0])
+    r0 = _geant4_origin(S.cart, np.asarray(L, float), ex3, ey3, Dx, Dy)
     proj = S.cart - np.outer(S.cart @ t_hat, t_hat)
     uq = np.unique(np.round(proj, 4), axis=0)
     ustr = (np.exp(1j * (Gs @ uq.T)) * cU[sig][:, None]).sum(axis=0).real / Om
