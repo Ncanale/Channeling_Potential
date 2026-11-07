@@ -1,0 +1,14 @@
+Si T = 77 K  axis <111>  plane (100)  method=fourier model=peng
+  Si: u = 0.0509 A  tier A (extrapolated)  [Peng 1996 Table 1 (DOI 10.1107/S010876739600089X)]
+  axial <111>: depth 128.49 eV, E_max 61.05 GeV/cm, theta_L(120 GeV) 46.28 urad
+  planar (100): d = 1.3577 A, depth 12.90 eV, E_max 4.69 GeV/cm
+RESULT Si <111> 128.49 eV  (100) 12.90 eV  T=77K
+  FastSim planes: output/fastsim/Si\T77K\Si_planes_100.dat  [1.3577 A, 679 intervals, Vmax 12.90 eV, Vmin 9.89 eV, emin amorphous]
+  FastSim axes: output/fastsim/Si\T77K\Si_axes_111.dat  [3.8403 x 2.2172 A, 166 x 96 intervals, Vmax 128.49 eV, Vmin 0.00 eV, emin amorphous]
+Si T = 293 K  axis <111>  plane (100)  method=fourier model=peng
+  Si: u = 0.0781 A  tier A (extrapolated)  [Peng 1996 Table 1 (DOI 10.1107/S010876739600089X)]
+  axial <111>: depth 98.50 eV, E_max 35.65 GeV/cm, theta_L(120 GeV) 40.52 urad
+  planar (100): d = 1.3577 A, depth 11.64 eV, E_max 3.79 GeV/cm
+RESULT Si <111> 98.50 eV  (100) 11.64 eV  T=293K
+  FastSim planes: output/fastsim/Si\T293K\Si_planes_100.dat  [1.3577 A, 679 intervals, Vmax 11.64 eV, Vmin 9.96 eV, emin amorphous]
+  FastSim axes: output/fastsim/Si\T293K\Si_axes_111.dat  [3.8403 x 2.2172 A, 109 x 63 intervals, Vmax 98.50 eV, Vmin 0.00 eV, emin amorphous]

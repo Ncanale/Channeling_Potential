@@ -1,0 +1,7 @@
+material,axis,plane,T_K,method,model,energy_GeV,axial_depth_eV,axial_Emax_GeV_cm,axial_theta_L_urad,planar_depth_eV,planar_d_A,planar_Emax_GeV_cm,planar_theta_L_urad,axial_shares,planar_shares,u_A,tier,extrapolated
+Si,100,110,77.0,fourier,peng,120.0,111.496,52.9,43.11,22.881,1.9201,6.74,19.53,Si:1.000,Si:1.000,Si:0.0509,Si:A,Si:1
+Si,100,110,293.0,fourier,peng,120.0,85.527,30.86,37.76,21.103,1.9201,5.51,18.75,Si:1.000,Si:1.000,Si:0.0781,Si:A,Si:1
+Si,110,111,77.0,fourier,peng,120.0,163.716,75.21,52.24,24.378,3.1356,6.32,20.16,Si:1.000,Si:1.000,Si:0.0509,Si:A,Si:1
+Si,110,111,293.0,fourier,peng,120.0,127.054,44.02,46.02,23.0,3.1356,5.26,19.58,Si:1.000,Si:1.000,Si:0.0781,Si:A,Si:1
+Si,111,100,77.0,fourier,peng,120.0,128.492,61.05,46.28,12.902,1.3577,4.69,14.66,Si:1.000,Si:1.000,Si:0.0509,Si:A,Si:1
+Si,111,100,293.0,fourier,peng,120.0,98.502,35.65,40.52,11.64,1.3577,3.79,13.93,Si:1.000,Si:1.000,Si:0.0781,Si:A,Si:1
